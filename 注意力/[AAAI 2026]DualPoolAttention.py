@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# 论文：Gaussian Adaptive Attention is All You Need: Robust Contextual Representations Across Multiple Modalities
-# 论文地址：https://arxiv.org/html/2401.11143v3
+# 论文： 
+# 论文地址： 
 class DualPoolAttention(nn.Module):
     """
     实现双池化注意力（Dual Pool Attention, DPA）
