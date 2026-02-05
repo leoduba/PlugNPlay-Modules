@@ -4,9 +4,6 @@ import torch.nn.functional as F
 # 论文：MKSNet: Advanced Small Object Detection inRemote Sensing Imagery with Multi-Kernel and Dual Attention Mechanisms
 # 论文地址：https://arxiv.org/pdf/2512.03640
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 class CAM(nn.Module):
