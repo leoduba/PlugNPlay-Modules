@@ -1,4 +1,5 @@
-#https://arxiv.org/html/2401.11143v3
+#GitHub地址：
+#论文地址：2https://arxiv.org/html/2401.11143v3
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
