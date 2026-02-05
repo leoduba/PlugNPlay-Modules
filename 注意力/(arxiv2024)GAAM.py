@@ -1,155 +1,109 @@
-#GitHub地址：
-#论文地址：2https://arxiv.org/html/2401.11143v3
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class GaussianAdaptiveAttention(nn.Module):
+class GAAM(nn.Module):
     """
-    高斯自适应注意力（Gaussian Adaptive Attention）
-    修复：门控融合维度不匹配问题，保证g_fuse与特征维度[batch, seq_len, d_model]完全一致
+    纯GAAM（Gaussian Adaptive Attention Mechanism）
+    无点积注意力，仅实现高斯自适应核心：可学习高斯核权重+特征自适应调制
+    输出：高斯自适应调制后的特征（与输入维度一致，供GQA融合）
     """
-    def __init__(self, 
-                 d_model: int,        # 输入特征维度
-                 n_heads: int = 8,     # 多头注意力头数
-                 d_k: int = None,      # 每个头的查询/键维度，默认d_model/n_heads
-                 d_v: int = None,      # 每个头的值维度，默认d_model/n_heads
-                 dropout: float = 0.1, # dropout概率
-                 eps: float = 1e-8):   # 数值稳定性极小值
+    def __init__(self, d_model, n_heads, d_k, eps=1e-8, dropout=0.1):
         super().__init__()
         self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_k = d_k if d_k is not None else d_model // n_heads
-        self.d_v = d_v if d_v is not None else d_model // n_heads
+        self.n_heads = n_heads  # 与GQA的查询头数一致
+        self.d_k = d_k
         self.eps = eps
         self.dropout = nn.Dropout(dropout)
 
-        # 1. 线性投影层：将输入特征映射为Q/K/V（多头）
-        self.w_q = nn.Linear(d_model, n_heads * self.d_k, bias=False)
-        self.w_k = nn.Linear(d_model, n_heads * self.d_k, bias=False)
-        self.w_v = nn.Linear(d_model, n_heads * self.d_v, bias=False)
-        # 输出投影层
-        self.w_o = nn.Linear(n_heads * self.d_v, d_model, bias=False)
+        # 线性投影：将输入特征映射为Q/K（GAAM无需V，高斯核直接调制Q/K特征）
+        self.w_q = nn.Linear(d_model, n_heads * d_k, bias=False)
+        self.w_k = nn.Linear(d_model, n_heads * d_k, bias=False)
+        # 输出投影+残差连接适配
+        self.w_o = nn.Linear(n_heads * d_k, d_model, bias=False)
 
-        # 2. 自适应参数生成MLP：生成高斯方差σ（n_heads）和门控g（n_heads）
-        self.adaptive_mlp = nn.Sequential(
+        # 高斯自适应参数MLP：生成每个头的高斯方差σ（可学习，>0）
+        self.sigma_mlp = nn.Sequential(
             nn.Linear(2 * d_model, d_model // 2),
             nn.GELU(),
-            nn.Linear(d_model // 2, 2 * n_heads)
+            nn.Linear(d_model // 2, n_heads)
         )
-        self.softplus = nn.Softplus()
-        self.sigmoid = nn.Sigmoid()
+        self.softplus = nn.Softplus()  # 保证σ>0
 
-        # 3. 基础注意力（标准点积多头注意力）
-        self.base_attention = nn.MultiheadAttention(
-            embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True
-        )
-
-        # 初始化参数
+        # 参数初始化
         self._init_weights()
 
     def _init_weights(self):
-        """参数初始化，保证训练稳定性"""
         nn.init.xavier_uniform_(self.w_q.weight)
         nn.init.xavier_uniform_(self.w_k.weight)
-        nn.init.xavier_uniform_(self.w_v.weight)
         nn.init.xavier_uniform_(self.w_o.weight)
-        for m in self.adaptive_mlp:
+        for m in self.sigma_mlp:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.constant_(m.bias, 0.)
 
-    def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """将投影后的特征拆分为多头：[batch, seq_len, n_heads*d_k] → [batch, n_heads, seq_len, d_k]"""
-        batch_size, seq_len, _ = x.shape
-        return x.view(batch_size, seq_len, self.n_heads, -1).transpose(1, 2)
+    def _split_heads(self, x):
+        """拆分多头：[b, seq, d_model] → [b, n_heads, seq, d_k]"""
+        b, seq, _ = x.shape
+        return x.view(b, seq, self.n_heads, self.d_k).transpose(1, 2)
 
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
-        """将多头特征合并：[batch, n_heads, seq_len, d_v] → [batch, seq_len, n_heads*d_v]"""
-        batch_size, _, seq_len, _ = x.shape
-        return x.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+    def _merge_heads(self, x):
+        """合并多头：[b, n_heads, seq, d_k] → [b, seq, d_model]"""
+        b, _, seq, _ = x.shape
+        return x.transpose(1, 2).contiguous().view(b, seq, -1)
 
-    def forward(self, 
-                Q: torch.Tensor, 
-                K: torch.Tensor, 
-                V: torch.Tensor, 
-                mask: torch.Tensor = None) -> torch.Tensor:
+    def forward(self, Q, K, mask=None):
         """
-        前向传播：修复门控融合维度不匹配问题
-        Input:
-            Q/K/V: [batch, seq_len, d_model] 
-            mask: [batch, 1, seq_len, seq_len] （True为遮蔽）
-        Output:
-            out: [batch, seq_len, d_model]
+        GAAM前向：高斯核建模自适应权重 → 调制特征 → 投影输出
+        Input: Q/K [b, seq, d_model], mask [b, 1, seq, seq]
+        Output: gaam_feat [b, seq, d_model] 高斯调制后的特征
         """
-        batch_size, seq_len, _ = Q.shape
-        # 步骤1：Q/K/V线性投影+多头拆分
-        q_proj = self._split_heads(self.w_q(Q))  # [b, h, Lq, dk]
-        k_proj = self._split_heads(self.w_k(K))  # [b, h, Lk, dk]
-        v_proj = self._split_heads(self.w_v(V))  # [b, h, Lv, dv]
+        b, seq, _ = Q.shape
+        # 1. Q/K投影+多头拆分
+        q_proj = self._split_heads(self.w_q(Q))  # [b, h, seq, d_k]
+        k_proj = self._split_heads(self.w_k(K))  # [b, h, seq, d_k]
 
-        # 步骤2：生成自适应σ（方差）和g（门控）
-        q_avg = Q.mean(dim=1)  # [b, d_model]
+        # 2. 生成可学习高斯方差σ（每个头独立σ，自适应）
+        q_avg = Q.mean(dim=1)  # [b, d_model] 全局平均池化
         k_avg = K.mean(dim=1)
-        adaptive_params = self.adaptive_mlp(torch.cat([q_avg, k_avg], dim=-1))  # [b, 2h]
-        sigma = self.softplus(adaptive_params[..., :self.n_heads]) + self.eps  # [b, h]
-        g = self.sigmoid(adaptive_params[..., self.n_heads:])  # [b, h] 门控：0~1
-        # 维度扩展：适配注意力权重矩阵 [b, h, 1, 1]
-        sigma = sigma.unsqueeze(-1).unsqueeze(-1)  # [b, h, 1, 1]
-        g = g.unsqueeze(-1).unsqueeze(-1)          # [b, h, 1, 1]
+        sigma = self.sigma_mlp(torch.cat([q_avg, k_avg], dim=-1))  # [b, h]
+        sigma = self.softplus(sigma) + self.eps  # 保证σ>0
+        sigma = sigma.unsqueeze(-1).unsqueeze(-1)  # [b, h, 1, 1] 广播适配
 
-        # 步骤3：计算高斯自适应注意力权重（核心公式）
-        qk_diff = q_proj.unsqueeze(3) - k_proj.unsqueeze(2)  # [b, h, Lq, Lk, dk]
-        l2_sq = torch.sum(qk_diff ** 2, dim=-1)  # [b, h, Lq, Lk] ||Qi-Kj||²
-        dot_sim = torch.matmul(q_proj, k_proj.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.d_k, dtype=torch.float32))  # [b, h, Lq, Lk]
-        gaussian_kernel = torch.exp(-l2_sq / (2 * sigma ** 2 + self.eps))  # 高斯核
-        attn_weight = gaussian_kernel * dot_sim  # 高斯自适应权重
+        # 3. 高斯核自适应权重计算（GAAM核心公式）
+        qk_diff = q_proj.unsqueeze(3) - k_proj.unsqueeze(2)  # [b, h, seq, seq, d_k]
+        l2_sq = torch.sum(qk_diff ** 2, dim=-1)  # ||Q-K||² [b, h, seq, seq]
+        gaam_weight = torch.exp(-l2_sq / (2 * sigma ** 2 + self.eps))  # 高斯核权重
 
-        # 步骤4：注意力掩码+归一化
+        # 4. 掩码+归一化
         if mask is not None:
-            attn_weight = attn_weight.masked_fill(mask, -1e9)
-        attn_weight = F.softmax(attn_weight, dim=-1)
-        attn_weight = self.dropout(attn_weight)
+            gaam_weight = gaam_weight.masked_fill(mask, -1e9)
+        gaam_weight = F.softmax(gaam_weight, dim=-1)
+        gaam_weight = self.dropout(gaam_weight)
 
-        # 步骤5：高斯注意力加权求和
-        gaussian_attn = torch.matmul(attn_weight, v_proj)  # [b, h, Lq, dv]
-        gaussian_attn = self._merge_heads(gaussian_attn)  # [b, Lq, h*dv] → [b, 10, 512]
+        # 5. 高斯自适应特征调制（加权K特征，作为GAAM输出）
+        gaam_feat = torch.matmul(gaam_weight, k_proj)  # [b, h, seq, d_k]
+        gaam_feat = self._merge_heads(gaam_feat)        # [b, seq, h*d_k]
+        gaam_feat = self.dropout(self.w_o(gaam_feat))   # [b, seq, d_model]
 
-        # 步骤6：高斯注意力与基础注意力自适应融合【核心修复：维度匹配】
-        base_attn, _ = self.base_attention(Q, K, V, attn_mask=mask)  # [b, Lq, d_model] → [4,10,512]
-        
-        # ========== 修复核心代码：门控g维度适配为[d_model] ==========
-        g_reshape = g.squeeze(-1).squeeze(-1)  # 恢复为[b, h]
-        # 每个头的门控广播到对应子维度[d_v]，再拼接为[d_model]
-        g_fuse = g_reshape.unsqueeze(1).unsqueeze(-1)  # [b,1,h,1]
-        g_fuse = g_fuse.expand(-1, seq_len, -1, self.d_v)  # [b, Lq, h, dv]
-        g_fuse = g_fuse.contiguous().view(batch_size, seq_len, -1)  # [b, Lq, h*dv=d_model] → [4,10,512]
-        # ==========================================================
-        
-        # 门控融合：逐元素相乘（维度完全匹配）
-        fuse_attn = g_fuse * gaussian_attn + (1 - g_fuse) * base_attn  # [4,10,512]
+        return gaam_feat
 
-        # 步骤7：输出投影+Dropout
-        out = self.dropout(self.w_o(fuse_attn))
-        return out
+# GAAM测试
 
 # -------------------------- 测试代码 --------------------------
 if __name__ == "__main__":
     # 超参数设置
-    d_model = 512  # 特征维度
-    n_heads = 8    # 多头数
-    batch_size = 4 # 批量
-    seq_len = 10   # 序列长度
+    d_model = 512    # 模型特征维度
+    n_q_heads = 8    # GQA查询头数（与MHA一致）
+    n_kv_heads = 4   # GQA键/值头数（需为n_q_heads的约数，8/4=2组，每组2个Q头共享1个KV头）
+    n_groups = n_q_heads // n_kv_heads  # 分组数，核心GQA参数
+    d_k = d_model // n_q_heads          # 每个查询头的维度
+    d_v = d_model // n_q_heads          # 每个键/值头的维度
+    batch_size = 4
+    seq_len = 10
+    eps = 1e-8       # 数值稳定性
+    dropout = 0.1
 
     # 初始化模型
-    gaa = GaussianAdaptiveAttention(d_model=d_model, n_heads=n_heads)
-    # 生成随机测试输入
-    Q = torch.randn(batch_size, seq_len, d_model)
-    K = torch.randn(batch_size, seq_len, d_model)
-    V = torch.randn(batch_size, seq_len, d_model)
-    # 前向传播
-    output = gaa(Q, K, V)
-    # 打印输出维度
-    print(f"输入维度：Q/K/V = {Q.shape}")
-    print(f"输出维度：Gaussian Adaptive Attention = {output.shape}")
-    print("✅ 代码修复成功，无维度错误，运行正常！")
+    gaam = GAAM(d_model, n_q_heads, d_k)
+    q_gaam = torch.randn(batch_size, seq_len, d_model)
+    k_gaam = torch.randn(batch_size, seq_len, d_model)
+    gaam_out = gaam(q_gaam, k_gaam)
+    print(f"GAAM输入维度：{q_gaam.shape}, 输出维度：{gaam_out.shape}")  # 维度一致
+     
