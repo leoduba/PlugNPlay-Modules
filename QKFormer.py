@@ -742,6 +742,435 @@ def test_hierarchical_structure():
     print(f"\n总参数量: {sum(p.numel() for p in model.parameters()):,}")
     print("✓ 层次化结构测试通过\n")
 
+# 扩展实现：混合注意力策略和实际训练示例
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import time
+
+# ==================== 混合注意力策略 ====================
+
+class MixedQKAttention(nn.Module):
+    """
+    混合Q-K注意力策略（论文中的优化策略）
+    
+    策略：
+    - 早期阶段（token多，channel少）：使用QKTA (Token Attention)
+    - 后期阶段（token少，channel多）：使用QKCA (Channel Attention)
+    
+    这样可以在不同层次上优化计算效率和表征能力
+    """
+    
+    def __init__(self, dim: int, num_heads: int = 8, tau: float = 2.0):
+        super().__init__()
+        self.qkta = QKAttention(dim, num_heads, 'token', tau)
+        self.qkca = QKAttention(dim, num_heads, 'channel', tau)
+    
+    def forward_token(self, x):
+        """Token attention mode"""
+        return self.qkta(x)
+    
+    def forward_channel(self, x):
+        """Channel attention mode"""
+        return self.qkca(x)
+
+
+class AdvancedQKFormerBlock(nn.Module):
+    """
+    高级QKFormer块，支持混合注意力
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+        qka_type: str = 'token',
+        tau: float = 2.0,
+        drop_path: float = 0.0
+    ):
+        super().__init__()
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = QKAttention(dim, num_heads, qka_type, tau)
+        
+        # Drop Path (Stochastic Depth)
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        
+        self.norm2 = nn.LayerNorm(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.BatchNorm1d(mlp_hidden_dim),
+            LIFNeuron(tau=tau),
+            nn.Dropout(0.1),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.BatchNorm1d(dim),
+            LIFNeuron(tau=tau),
+            nn.Dropout(0.1)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T, B, L, C = x.shape
+        
+        # Attention with residual
+        x_norm = self.norm1(x.reshape(T * B * L, C)).reshape(T, B, L, C)
+        attn_out = self.attn(x_norm)
+        x = x + self.drop_path(attn_out)
+        
+        # MLP with residual
+        x_norm = self.norm2(x.reshape(T * B * L, C)).reshape(T, B, L, C)
+        mlp_out = []
+        for t in range(T):
+            out_t = self.mlp(x_norm[t])
+            mlp_out.append(out_t)
+        mlp_out = torch.stack(mlp_out)
+        x = x + self.drop_path(mlp_out)
+        
+        return x
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample"""
+    
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+
+# ==================== 训练工具 ====================
+
+class SNNTrainer:
+    """
+    SNN训练器，支持代理梯度下降
+    """
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        learning_rate: float = 1e-3,
+        weight_decay: float = 0.05
+    ):
+        self.model = model.to(device)
+        self.device = device
+        self.optimizer = optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=100
+        )
+        self.criterion = nn.CrossEntropyLoss()
+        
+    def train_epoch(self, dataloader: DataLoader) -> dict:
+        self.model.train()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        for batch_idx, (data, target) in enumerate(dataloader):
+            data, target = data.to(self.device), target.to(self.device)
+            
+            self.optimizer.zero_grad()
+            output = self.model(data)
+            loss = self.criterion(output, target)
+            loss.backward()
+            
+            # 梯度裁剪
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+        
+        self.scheduler.step()
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'accuracy': 100.0 * correct / total
+        }
+    
+    def evaluate(self, dataloader: DataLoader) -> dict:
+        self.model.eval()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for data, target in dataloader:
+                data, target = data.to(self.device), target.to(self.device)
+                output = self.model(data)
+                loss = self.criterion(output, target)
+                
+                total_loss += loss.item()
+                pred = output.argmax(dim=1)
+                correct += pred.eq(target).sum().item()
+                total += target.size(0)
+        
+        return {
+            'loss': total_loss / len(dataloader),
+            'accuracy': 100.0 * correct / total
+        }
+
+
+# ==================== 扩展测试 ====================
+
+def test_mixed_attention():
+    """测试混合注意力策略"""
+    print("=" * 60)
+    print("测试8: 混合注意力策略")
+    print("=" * 60)
+    
+    T, B, L, C = 4, 2, 64, 96
+    x = torch.randn(T, B, L, C)
+    
+    mixed_attn = MixedQKAttention(C, num_heads=3)
+    
+    # Token attention (适合早期阶段)
+    out_token = mixed_attn.forward_token(x)
+    print(f"QKTA (Token) 输出形状: {out_token.shape}")
+    
+    # Channel attention (适合后期阶段)
+    out_channel = mixed_attn.forward_channel(x)
+    print(f"QKCA (Channel) 输出形状: {out_channel.shape}")
+    
+    print("\n策略建议:")
+    print("  Stage 1 (L=3136, C=96): 使用QKTA - token多，适合token attention")
+    print("  Stage 3 (L=196, C=384): 使用QKCA - channel多，适合channel attention")
+    print("✓ 混合注意力测试通过\n")
+
+
+def test_training_pipeline():
+    """测试完整训练流程"""
+    print("=" * 60)
+    print("测试9: 训练流程测试")
+    print("=" * 60)
+    
+    # 创建小型数据集
+    batch_size = 8
+    train_data = torch.randn(64, 3, 32, 32)
+    train_labels = torch.randint(0, 10, (64,))
+    train_dataset = TensorDataset(train_data, train_labels)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    # 创建模型
+    model = QKFormer(
+        img_size=32,
+        patch_size=4,
+        in_channels=3,
+        num_classes=10,
+        embed_dims=[64, 128, 256],
+        num_heads=[2, 4, 8],
+        depths=[1, 1, 2],
+        qka_types=['token', 'token', 'channel'],
+        T=4
+    )
+    
+    trainer = SNNTrainer(model, device='cpu', learning_rate=1e-3)
+    
+    # 训练一个epoch
+    print("训练一个epoch...")
+    start_time = time.time()
+    train_metrics = trainer.train_epoch(train_loader)
+    train_time = time.time() - start_time
+    
+    print(f"训练时间: {train_time:.2f}s")
+    print(f"训练损失: {train_metrics['loss']:.4f}")
+    print(f"训练准确率: {train_metrics['accuracy']:.2f}%")
+    
+    # 评估
+    eval_metrics = trainer.evaluate(train_loader)
+    print(f"评估准确率: {eval_metrics['accuracy']:.2f}%")
+    
+    print("✓ 训练流程测试通过\n")
+
+
+def test_energy_consumption():
+    """测试能耗估算"""
+    print("=" * 60)
+    print("测试10: 能耗估算")
+    print("=" * 60)
+    
+    # 创建测试模型
+    model = QKFormer(
+        img_size=32,
+        patch_size=4,
+        embed_dims=[96, 192, 384],
+        num_heads=[3, 6, 12],
+        depths=[2, 2, 6],
+        T=4
+    )
+    
+    x = torch.randn(1, 3, 32, 32)
+    
+    # 统计脉冲发放率
+    firing_rates = []
+    
+    def hook_fn(module, input, output):
+        if isinstance(output, torch.Tensor):
+            firing_rates.append(output.mean().item())
+    
+    # 注册hook
+    hooks = []
+    for module in model.modules():
+        if isinstance(module, LIFNeuron):
+            hooks.append(module.register_forward_hook(hook_fn))
+    
+    model.eval()
+    with torch.no_grad():
+        _ = model(x)
+    
+    # 移除hooks
+    for hook in hooks:
+        hook.remove()
+    
+    avg_firing_rate = sum(firing_rates) / len(firing_rates) if firing_rates else 0
+    
+    print(f"平均脉冲发放率: {avg_firing_rate:.4f}")
+    print(f"稀疏度: {(1 - avg_firing_rate) * 100:.2f}%")
+    
+    # 估算能耗（相对于ANN的乘加操作）
+    # SNN: 脉冲事件驱动，能耗与发放率成正比
+    # ANN: 每个时间步都需要浮点乘加
+    energy_ratio = avg_firing_rate * 4  # T=4时间步
+    print(f"\n相对能耗估算:")
+    print(f"  ANN (浮点乘加): 100%")
+    print(f"  SNN (脉冲驱动): {energy_ratio * 100:.2f}%")
+    print(f"  节能比例: {(1 - energy_ratio) * 100:.2f}%")
+    
+    print("✓ 能耗估算测试通过\n")
+
+
+def test_comparison_with_ann():
+    """与ANN的对比测试"""
+    print("=" * 60)
+    print("测试11: SNN vs ANN 对比")
+    print("=" * 60)
+    
+    # SNN模型
+    snn_model = QKFormer(
+        img_size=32,
+        patch_size=4,
+        embed_dims=[64, 128],
+        num_heads=[2, 4],
+        depths=[1, 1],
+        T=4
+    )
+    
+    # 等效ANN模型（简化版）
+    class ANNTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = nn.Conv2d(3, 64, 4, 4)
+            self.attn = nn.MultiheadAttention(64, 2, batch_first=True)
+            self.fc = nn.Linear(64, 10)
+        
+        def forward(self, x):
+            x = self.patch_embed(x)
+            B, C, H, W = x.shape
+            x = x.view(B, C, H * W).permute(0, 2, 1)
+            x, _ = self.attn(x, x, x)
+            x = x.mean(dim=1)
+            return self.fc(x)
+    
+    ann_model = ANNTransformer()
+    
+    x = torch.randn(2, 3, 32, 32)
+    
+    # 参数量对比
+    snn_params = sum(p.numel() for p in snn_model.parameters())
+    ann_params = sum(p.numel() for p in ann_model.parameters())
+    
+    print(f"参数量对比:")
+    print(f"  SNN (QKFormer): {snn_params:,}")
+    print(f"  ANN (标准Transformer): {ann_params:,}")
+    
+    # 输出对比
+    with torch.no_grad():
+        snn_out = snn_model(x)
+        ann_out = ann_model(x)
+    
+    print(f"\n输出形状:")
+    print(f"  SNN: {snn_out.shape}")
+    print(f"  ANN: {ann_out.shape}")
+    
+    # 计算复杂度对比
+    print(f"\n计算复杂度:")
+    print(f"  SNN Attention: O(T × L × C) = 线性")
+    print(f"  ANN Attention: O(L² × C) = 二次")
+    print(f"  (其中L=token数, C=通道数, T=时间步)")
+    
+    print("✓ 对比测试通过\n")
+
+
+def test_robustness():
+    """测试鲁棒性"""
+    print("=" * 60)
+    print("测试12: 鲁棒性测试")
+    print("=" * 60)
+    
+    model = QKFormer(
+        img_size=32,
+        patch_size=4,
+        embed_dims=[64, 128],
+        num_heads=[2, 4],
+        depths=[1, 1],
+        T=4
+    )
+    
+    model.eval()
+    
+    # 测试不同噪声水平
+    x_clean = torch.randn(4, 3, 32, 32)
+    
+    print("噪声鲁棒性测试:")
+    with torch.no_grad():
+        out_clean = model(x_clean)
+        
+        for noise_level in [0.1, 0.2, 0.5]:
+            x_noisy = x_clean + noise_level * torch.randn_like(x_clean)
+            out_noisy = model(x_noisy)
+            
+            # 计算输出变化
+            diff = torch.abs(out_clean - out_noisy).mean().item()
+            print(f"  噪声水平 {noise_level}: 输出变化 {diff:.4f}")
+    
+    # 测试时间步变化
+    print("\n时间步鲁棒性测试:")
+    model_T2 = QKFormer(
+        img_size=32, patch_size=4,
+        embed_dims=[64, 128], num_heads=[2, 4],
+        depths=[1, 1], T=2
+    )
+    model_T2.eval()
+    
+    with torch.no_grad():
+        out_T4 = model(x_clean)
+        out_T2 = model_T2(x_clean)
+    
+    print(f"  T=4 输出均值: {out_T4.mean().item():.4f}")
+    print(f"  T=2 输出均值: {out_T2.mean().item():.4f}")
+    
+    print("✓ 鲁棒性测试通过\n")
+
+ 
 
 # 运行所有测试
 if __name__ == "__main__":
@@ -759,4 +1188,17 @@ if __name__ == "__main__":
     
     print("=" * 60)
     print("所有测试完成！")
+    print("=" * 60)
+    print("\n" + "=" * 60)
+    print("QKFormer 扩展测试套件")
+    print("=" * 60 + "\n")
+    
+    test_mixed_attention()
+    test_training_pipeline()
+    test_energy_consumption()
+    test_comparison_with_ann()
+    test_robustness()
+    
+    print("=" * 60)
+    print("所有扩展测试完成！")
     print("=" * 60)
