@@ -1,3 +1,16 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+ 
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+import torch
+import torch.nn as nn
+import os
+import torch.optim as optim
 class ChannelAttention(nn.Module):
     def __init__(self, in_planes, ratio=16):
         super(ChannelAttention, self).__init__()
@@ -13,29 +26,6 @@ class ChannelAttention(nn.Module):
         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
         out = avg_out + max_out
         return self.sigmoid(out)
-
-  import torch
-import torch.nn as nn
-import torch.optim as optim
-
-
-class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-        # 注意：原代码此处硬编码为16，未使用传入的ratio参数，测试会提示
-        self.fc1 = nn.Conv2d(in_planes, max(in_planes // 16, 1), kernel_size=1, bias=False)
-        self.relu1 = nn.ReLU()
-        self.fc2 = nn.Conv2d(max(in_planes // 16, 1), in_planes, kernel_size=1, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
-        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
-        out = avg_out + max_out
-        return self.sigmoid(out)
-
 
 def test_forward_shape():
     """测试基本前向传播的输出形状（应为(B,C,1,1)）"""
